@@ -3,6 +3,8 @@ __pycache__
 *.pyc
 *.egg-info/
 
+*.mp4
+
 # MacOS
 *.DS_Store
 
@@ -20,3 +22,4 @@ __pycache__
 /SimpleEnv/octo_collect/
 /SimpleEnv/wandb/
 
+/wandb/
