@@ -40,8 +40,9 @@ def huber_loss(e, d):
     return a * e ** 2 / 2 + b * d * (abs(e) - d / 2)
 
 
-class MLPPolicy:
+class MLPPolicy(nn.Module):
     def __init__(self, all_args, device: torch.device):
+        super().__init__()
         self.args = all_args
         self.device = device
         self.tpdv = dict(device=self.device, dtype=torch.float32)
@@ -54,27 +55,19 @@ class MLPPolicy:
 
         
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        resnet_feature_dim = 64
+        resnet_feature_dim = 512  # ResNet18 final feature dimension
 
-        # 2. MLP for state processing
-        state_input_dim = 10  # 3 (pos) + 6 (rot) + 1 (gripper)
-        self.state_mlp = nn.Sequential(
-            nn.Linear(state_input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, resnet_feature_dim)
-        ).to(**self.tpdv)
-
-        # 3. Fusion MLP to combine image and state features
-        fusion_input_dim = 512 + resnet_feature_dim
+        # 2. Image processing MLP (replacing fusion MLP)
         final_embedding_dim = self.args.mlp_embedding_size
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(fusion_input_dim, 512),
+        self.image_mlp = nn.Sequential(
+            nn.Linear(resnet_feature_dim, 512),
             nn.ReLU(),
             nn.Linear(512, final_embedding_dim)
         ).to(**self.tpdv)
 
         # 4. Actor and Critic Heads
-        self.action_dim = 10  # 3 (delta_pos) + 6 (rot_6d) + 1 (gripper)
+        # Use action_dim from args if available, otherwise default to 8
+        self.action_dim = getattr(self.args, 'action_dim', 8)  # 7 (pose) + 1 (gripper)
         self.actor = nn.Sequential(
             nn.Linear(final_embedding_dim, 512),
             nn.ReLU(),
@@ -90,13 +83,11 @@ class MLPPolicy:
         # Learnable parameter for the standard deviation of the action distribution
         self.action_log_std = nn.Parameter(torch.zeros(1, self.action_dim, device=self.device))
         
-        # --- Optimizer ---
-        self.trainable_params = list(self.state_mlp.parameters()) + \
-                               list(self.fusion_mlp.parameters()) + \
-                               list(self.actor.parameters()) + \
-                               list(self.critic.parameters()) + \
-                               [self.action_log_std]
-        self.optimizer = torch.optim.Adam(self.trainable_params, lr=self.args.alg_lr)
+        # Note: Optimizer will be created externally
+    
+    def get_trainable_params(self):
+        """Get all trainable parameters for optimizer creation"""
+        return list(self.parameters())
 
     # --- Pose Transformation Utilities ---
     def _euler_to_rotation_matrix(self, euler: torch.Tensor) -> torch.Tensor:
@@ -122,28 +113,17 @@ class MLPPolicy:
 
     # --- Core Policy Methods ---
     def _get_embedding(self, x: dict) -> torch.Tensor:
-        """Processes raw observation dict to a fused feature embedding."""
-        # Process image: (B, H, W, C) -> (B, 512)
-        image_obs = x['image'].to(self.device, dtype=torch.uint8)
-        image_obs_float = image_obs.to(torch.float32) / 255.0
-        images = image_obs_float.permute(0, 3, 1, 2)
+        """Processes raw observation dict to image feature embedding."""
+        # Process image: expect (B, C, H, W) format already preprocessed and normalized
+        images = x['image'].to(self.device, dtype=torch.float32)
+        
         with torch.no_grad():
             img_features = self.resnet(images)
             img_features = self.avgpool(img_features)
             img_features = torch.flatten(img_features, 1)
 
-        # Process state: (B, 7) -> (B, 10) -> (B, 512)
-        state_obs = x['state'].to(**self.tpdv)
-        pos, euler, gripper = state_obs[:, :3], state_obs[:, 3:6], state_obs[:, 6].unsqueeze(-1)
-        rot_mat = self._euler_to_rotation_matrix(euler)
-        rot_6d = rot_mat[:, :2, :].reshape(-1, 6)
-        
-        processed_state = torch.cat([pos, rot_6d, gripper], dim=1)
-        state_features = self.state_mlp(processed_state)
-
-        # Fuse features
-        fused_features = torch.cat([img_features, state_features], dim=1)
-        return self.fusion_mlp(fused_features)
+        # Process image features through MLP
+        return self.image_mlp(img_features)
 
     def _get_action_dist(self, embedding: torch.Tensor) -> torch.distributions.Normal:
         """Gets the action distribution from the embedding."""
@@ -176,7 +156,9 @@ class MLPPolicy:
     #     return torch.cat([abs_pos, abs_euler, abs_gripper], dim=1)
 
     def get_action(self, x: dict, deterministic=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        embedding = self._get_embedding(x)
+        # Only use image, no state needed
+        obs_dict = {"image": x["image"]} if "image" in x else x
+        embedding = self._get_embedding(obs_dict)
         dist = self._get_action_dist(embedding)
 
         if deterministic:
@@ -192,41 +174,20 @@ class MLPPolicy:
         return value, final_action, log_prob
 
     def get_value(self, x: dict) -> torch.Tensor:
-        embedding = self._get_embedding(x)
+        # Only use image, no state needed
+        obs_dict = {"image": x["image"]} if "image" in x else x
+        embedding = self._get_embedding(obs_dict)
         return self.critic(embedding)
 
     def evaluate_actions(self, x: dict, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluates actions for PPO training."""
-        embedding = self._get_embedding(x)
+        # Only use image, no state needed
+        obs_dict = {"image": x["image"]} if "image" in x else x
+        embedding = self._get_embedding(obs_dict)
         dist = self._get_action_dist(embedding)
         
-        # Reverse the action post-processing to get the raw action
-        abs_pos, abs_6d, abs_gripper = action[:, :3], action[:, 3:9], action[:, 9].unsqueeze(-1)
-        R_abs_target = self._6d_to_rotation_matrix(abs_6d)
-        T_abs_target = torch.eye(4, **self.tpdv).unsqueeze(0).repeat(action.shape[0], 1, 1)
-        T_abs_target[:, :3, :3] = R_abs_target
-        T_abs_target[:, :3, 3] = abs_pos
-        
-        current_state = x['state'].to(**self.tpdv)
-        current_pos, current_6d = current_state[:, :3], current_state[:, 3:9]
-        R_current = self._6d_to_rotation_matrix(current_6d)
-        T_current = torch.eye(4, **self.tpdv).unsqueeze(0).repeat(action.shape[0], 1, 1)
-        T_current[:, :3, :3] = R_current
-        T_current[:, :3, 3] = current_pos
-        
-        R_current_inv = R_current.transpose(1, 2)
-        T_current_inv = torch.eye(4, **self.tpdv).unsqueeze(0).repeat(action.shape[0], 1, 1)
-        T_current_inv[:, :3, :3] = R_current_inv
-        T_current_inv[:, :3, 3] = -torch.bmm(R_current_inv, current_pos.unsqueeze(-1)).squeeze(-1)
-        T_delta = torch.bmm(T_current_inv, T_abs_target)
-
-        delta_pos = T_delta[:, :3, 3]
-        R_delta = T_delta[:, :3, :3]
-        rot_6d = R_delta[:, :2, :].reshape(-1, 6)
-        
-        raw_action_reconstructed = torch.cat([delta_pos, rot_6d, abs_gripper], dim=1)
-
-        log_prob = dist.log_prob(raw_action_reconstructed).sum(axis=-1, keepdim=True)
+        # For image-only model, we directly use the action without state-based transformation
+        log_prob = dist.log_prob(action).sum(axis=-1, keepdim=True)
         entropy = dist.entropy().sum(axis=-1, keepdim=True)
         value = self.critic(embedding)
         
@@ -236,37 +197,37 @@ class MLPPolicy:
         """Set models to evaluation mode."""
         self.actor.eval()
         self.critic.eval()
-        self.state_mlp.eval()
-        self.fusion_mlp.eval()
+        self.image_mlp.eval()
 
     def prep_training(self):
         """Set models to training mode."""
         self.actor.train()
         self.critic.train()
-        self.state_mlp.train()
-        self.fusion_mlp.train()
+        self.image_mlp.train()
 
     def save(self, path: Path):
-        """Saves the model and optimizer states."""
+        """Saves the model states."""
         path.mkdir(parents=True, exist_ok=True)
         torch.save({
-            'state_mlp_state_dict': self.state_mlp.state_dict(),
-            'fusion_mlp_state_dict': self.fusion_mlp.state_dict(),
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'action_log_std': self.action_log_std,
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'model_state_dict': self.state_dict(),
         }, path / "mlp_policy.pt")
 
     def load(self, path: Path):
-        """Loads the model and optimizer states."""
+        """Loads the model states."""
         checkpoint = torch.load(path / "mlp_policy.pt", map_location=self.device)
-        self.state_mlp.load_state_dict(checkpoint['state_mlp_state_dict'])
-        self.fusion_mlp.load_state_dict(checkpoint['fusion_mlp_state_dict'])
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.action_log_std.data.copy_(checkpoint['action_log_std'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'model_state_dict' in checkpoint:
+            # New format
+            self.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # Legacy format - try to load individual components
+            if 'image_mlp_state_dict' in checkpoint:
+                self.image_mlp.load_state_dict(checkpoint['image_mlp_state_dict'])
+            if 'actor_state_dict' in checkpoint:
+                self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            if 'critic_state_dict' in checkpoint:
+                self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            if 'action_log_std' in checkpoint:
+                self.action_log_std.data.copy_(checkpoint['action_log_std'])
 
 
 class MLPPPO:
@@ -278,13 +239,16 @@ class MLPPPO:
         self.ppo_entropy_coef = self.args.alg_entropy_coef
         self.ppo_huber_delta = 10.0
         self.tpdv = self.policy.tpdv
+        
+        # Create optimizer
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.args.alg_lr)
 
     def train_ppo_step(self, idx, total, batch):
         obs_image, obs_state, actions, value_preds, returns, masks, old_logprob, advantages = batch
 
+        # Only use image, ignore state
         obs = dict(
-            image=torch.tensor(obs_image).to(**self.tpdv),
-            state=torch.tensor(obs_state).to(**self.tpdv)
+            image=torch.tensor(obs_image).to(**self.tpdv)
         )
         actions = torch.tensor(actions).to(**self.tpdv)
         value_preds = torch.tensor(value_preds).to(**self.tpdv)
@@ -318,9 +282,9 @@ class MLPPPO:
         loss.backward()
 
         if idx % self.args.alg_gradient_accum == (self.args.alg_gradient_accum - 1) or idx == (total - 1):
-            grad_norm = nn.utils.clip_grad_norm_(self.policy.trainable_params, self.ppo_grad_norm)
-            self.policy.optimizer.step()
-            self.policy.optimizer.zero_grad()
+            grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.ppo_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         else:
             grad_norm = None
 

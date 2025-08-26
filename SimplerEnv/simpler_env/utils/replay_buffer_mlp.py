@@ -9,9 +9,13 @@ class SeparatedReplayBufferMLP(object):
         self.gae_lambda = all_args.buffer_lambda
         self.buffer_minibatch = all_args.buffer_minibatch
         self.alg_grpo_fix = all_args.alg_grpo_fix
+        self.use_state = state_dim > 0  # Only use state if state_dim > 0
 
         self.obs = np.zeros((self.ep_len + 1, self.num_env, *obs_dim), dtype=np.uint8)
-        self.state = np.zeros((self.ep_len + 1, self.num_env, state_dim), dtype=np.float32)
+        if self.use_state:
+            self.state = np.zeros((self.ep_len + 1, self.num_env, state_dim), dtype=np.float32)
+        else:
+            self.state = None  # No state storage if not used
         self.value_preds = np.zeros((self.ep_len + 1, self.num_env, 1), dtype=np.float32)
         self.returns = np.zeros((self.ep_len, self.num_env, 1), dtype=np.float32)
         self.actions = np.zeros((self.ep_len, self.num_env, act_dim), dtype=np.int32)
@@ -25,7 +29,8 @@ class SeparatedReplayBufferMLP(object):
 
     def insert(self, obs, state, actions, action_log_probs, value_preds, rewards, masks):
         self.obs[self.step + 1] = obs.copy()
-        self.state[self.step + 1] = state.copy()
+        if self.use_state and state is not None:
+            self.state[self.step + 1] = state.copy()
         self.actions[self.step] = actions.copy()
         self.action_log_probs[self.step] = action_log_probs.copy()
         self.value_preds[self.step] = value_preds.copy()
@@ -36,7 +41,8 @@ class SeparatedReplayBufferMLP(object):
 
     def warmup(self, obs, state):
         self.obs[0] = obs
-        self.state[0] = state
+        if self.use_state and state is not None:
+            self.state[0] = state
         self.masks[0] = 1.0
 
         self.step = 0
@@ -103,7 +109,10 @@ class SeparatedReplayBufferMLP(object):
         sampler = [rand[i * self.buffer_minibatch:(i + 1) * self.buffer_minibatch] for i in range(num_mini_batch)]
 
         obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
-        state = self.state[:-1].reshape(-1, *self.state.shape[2:])
+        if self.use_state:
+            state = self.state[:-1].reshape(-1, *self.state.shape[2:])
+        else:
+            state = None
         actions = self.actions.reshape(-1, self.actions.shape[-1])
         value_preds = self.value_preds[:-1].reshape(-1, 1)
         returns = self.returns.reshape(-1, 1)
@@ -114,15 +123,13 @@ class SeparatedReplayBufferMLP(object):
         for indices in sampler:
             # obs size [T+1 N Dim]-->[T N Dim]-->[T*N,Dim]-->[index,Dim]
             obs_batch = obs[indices]
-            state_batch = state[indices]
+            state_batch = state[indices] if self.use_state else None
             actions_batch = actions[indices]
             value_preds_batch = value_preds[indices]
             return_batch = returns[indices]
             masks_batch = masks[indices]
             old_action_logits_batch = action_logits[indices]
             adv_targ = advantages[indices]
-
-
 
             yield (obs_batch, state_batch, actions_batch, value_preds_batch, return_batch, masks_batch,
                    old_action_logits_batch, adv_targ)

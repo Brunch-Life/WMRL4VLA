@@ -129,8 +129,8 @@ class Runner:
         self.buffer = SeparatedReplayBufferMLP(
             all_args,
             obs_dim=(480, 640, 3),
-            state_dim=10,
-            act_dim=10,
+            state_dim=0,  # No state input
+            act_dim=8,  # 7 pose + 1 gripper
         )
         minibatch_count = self.buffer.get_minibatch_count()
         print(f"Buffer minibatch count: {minibatch_count}")
@@ -139,7 +139,7 @@ class Runner:
     def _get_action(self, obs: dict, deterministic=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert isinstance(obs, dict)
         assert isinstance(obs["image"], torch.Tensor)
-        assert isinstance(obs["state"], torch.Tensor)
+        # No longer need state assertion
         
         total_batch = obs["image"].shape[0]
 
@@ -148,7 +148,8 @@ class Runner:
         logprobs = []
 
         for i in range(0, total_batch, self.args.buffer_inferbatch):
-            obs_batch = {k: v[i:i + self.args.buffer_inferbatch] for k, v in obs.items()}
+            # Only pass image data
+            obs_batch = {"image": obs["image"][i:i + self.args.buffer_inferbatch]}
             value, action, logprob = self.policy.get_action(obs_batch, deterministic)
             values.append(value)
             actions.append(action)
@@ -166,34 +167,32 @@ class Runner:
         obs_image = self.buffer.obs[self.buffer.step]
         obs_image = torch.tensor(obs_image).to(self.device)
 
-        state = self.buffer.state[self.buffer.step]
-        state = torch.tensor(state).to(self.device)
-
-        obs = dict(image=obs_image, state=state)
+        # No state needed
+        obs = dict(image=obs_image)
         value, action, logprob = self._get_action(obs)
 
         return value, action, logprob
 
     def insert(self, data):
-        obs_img, state, actions, logprob, value_preds, rewards, terminated, truncated = data
+        obs_img, actions, logprob, value_preds, rewards, terminated, truncated = data
         masks = 1.0 - truncated.to(torch.float32)
 
         obs_img = obs_img
-        state = state
         actions = actions.to(torch.int32).cpu().numpy()
         logprob = logprob.to(torch.float32).cpu().numpy()
         value_preds = value_preds.to(torch.float32).cpu().numpy()
         rewards = rewards.cpu().numpy()
         masks = masks.cpu().numpy()
 
-        self.buffer.insert(obs_img, state, actions, logprob, value_preds, rewards, masks)
+        # Pass empty state (None) since we don't use state
+        self.buffer.insert(obs_img, None, actions, logprob, value_preds, rewards, masks)
 
     def compute_endup(self):
         self.policy.prep_rollout()
 
         obs_image = torch.tensor(self.buffer.obs[-1]).to(self.device)
-        state = torch.tensor(self.buffer.state[-1]).to(self.device)
-        obs = dict(image=obs_image, state=state)
+        # No state needed
+        obs = dict(image=obs_image)
         with torch.no_grad():
             next_value, _, _ = self._get_action(obs)
         next_value = next_value.to(torch.float32).cpu().numpy()
@@ -220,17 +219,16 @@ class Runner:
         env_infos = defaultdict(lambda: [])
 
 
-        obs_img, state, info = self.env_wrapper.reset(eps_count=0)
+        obs_img, _, info = self.env_wrapper.reset(eps_count=0)  # ignore state
         obs_img = torch.tensor(obs_img).to(self.device)
-        state = torch.tensor(state).to(self.device)
 
         for _ in range(self.args.episode_len):
-            obs = dict(image=obs_img, state=state)
-            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor, state: tensor
+            obs = dict(image=obs_img)  # only image
+            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor
             value, action, logprob = self._get_action(obs, deterministic=True) # need tensor
             print(f"!!action: {action[0]}")
 
-            obs_img, state, reward, terminated, truncated, env_info = self.env_wrapper.step(action)
+            obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
 
             # info
             print({k: round(v.to(torch.float32).mean().tolist(), 4) for k, v in env_info.items() if k != "episode"})
@@ -260,21 +258,17 @@ class Runner:
             "info": [],  # info after executing a_t: [1, T]
         } for idx in range(self.args.num_envs)]
 
-        obs_img, state, info = self.env_wrapper.reset(eps_count=0) # obs_img: np.ndarray, state: np.ndarray, info: dict
+        obs_img, _, info = self.env_wrapper.reset(eps_count=0) # obs_img: np.ndarray, ignore state, info: dict
 
-
-        # data dump: state
-        # TODO: this is a hack, should be fixed
-        for idx in range(self.args.num_envs):
-            datas[idx]["state"] = state[idx] # state: np.ndarray
+        # No state data to dump since we don't use state
 
         for _ in range(self.args.episode_len):
-            obs = dict(image=obs_img, state=state) # obs: dict, image: np.ndarray, state: np.ndarray
-            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor, state: tensor
+            obs = dict(image=obs_img) # obs: dict, image: np.ndarray
+            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor
             value, action, logprob = self._get_action(obs, deterministic=True) # action: tensor
 
-            #action: tensor, obs_img: np.ndarray, state: np.ndarray, reward: tensor, terminated: tensor, truncated: tensor, env_info: dict
-            obs_img_new, state, reward, terminated, truncated, env_info = self.env_wrapper.step(action) 
+            #action: tensor, obs_img: np.ndarray, reward: tensor, terminated: tensor, truncated: tensor, env_info: dict
+            obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state 
 
             # info
             print({k: round(v.to(torch.float32).mean().tolist(), 4) for k, v in env_info.items() if k != "episode"})
@@ -312,7 +306,7 @@ class Runner:
                 for j in range(len(infos)):
                     images[j + 1] = visualization.put_info_on_image(
                         images[j + 1], infos[j],
-                        extras=[f"State: {state[i]}"]
+                        extras=[]  # No state info since we don't use state
                     )
 
             success = int(infos[-1]["success"])
@@ -337,7 +331,7 @@ class Runner:
         save_stats["ep_len"] = self.args.episode_len
         save_stats["epoch"] = epoch
         save_stats["stats"] = {k: v.item() for k, v in env_stats.items()}
-        save_stats["state"] = {idx: ins for idx, ins in enumerate(state)}
+        # No state to save since we don't use state
         save_stats["last_info"] = last_info
 
         yaml.dump(save_stats, open(exp_dir / "stats.yaml", "w"))
@@ -351,16 +345,16 @@ class Runner:
             env_infos = defaultdict(lambda: [])
             ep_time = time.time() 
 
-            obs_img, state, info = self.env_wrapper.reset(eps_count=episode)
+            obs_img, _, info = self.env_wrapper.reset(eps_count=episode)  # ignore state
 
             # TODO: check buffer warmup
-            self.buffer.warmup(obs_img, state)
+            self.buffer.warmup(obs_img, None)  # no state
 
             for _ in tqdm(range(self.args.episode_len), desc="rollout"):
                 value, action, logprob = self.collect()
-                obs_img, state, reward, terminated, truncated, env_info = self.env_wrapper.step(action)
+                obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
 
-                data = (obs_img, state, action, logprob, value, reward, terminated, truncated)
+                data = (obs_img, action, logprob, value, reward, terminated, truncated)  # removed state
                 self.insert(data)
 
                 # info

@@ -61,10 +61,7 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
                             doc='Observation image.'
                         ),
                     }),
-                    'language_instruction': tfds.features.Text(
-                        doc='Language Instruction.'
-                    ),
-                    'action': tfds.features.Tensor(shape=(7,), dtype=np.float32, ),
+                    'action': tfds.features.Tensor(shape=(8,), dtype=np.float32, ),
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
                     'file_path': tfds.features.Text(
@@ -76,8 +73,8 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            'train': self._generate_examples(16384, spare=16),
-            'val': self._generate_examples(16, start=16384),
+            'train': self._generate_examples(15, spare=5),
+            'val': self._generate_examples(5, start=15),
         }
 
     def _generate_examples(self, num_ep, spare=0, start=0) -> Iterator[Tuple[str, Any]]:
@@ -87,35 +84,21 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
             data = np.load(episode_path, allow_pickle=True)["arr_0"].tolist()
 
             # prepare data
-            ins = data['instruction']
-            ins = ins.tolist()[0] if isinstance(ins, np.ndarray) else ins
-            actions = data["action"]
-            images = np.asarray([np.asarray(img) for img in data["image"]])
-
-            mask = filter_small_actions(data["action"])
-            actions = actions[mask]
-            images = images[mask]
-            num_filtered = mask.shape[0] - mask.sum()
-            print(f"Filtered {num_filtered}/{mask.shape[0]} actions")
+            actions = np.concatenate(
+                [data["action"]["end"]["position"].squeeze(1), data["action"]["end"]["orientation"].squeeze(1), data["action"]["effector"]["position_gripper"]],
+                axis=1
+            )
+            images = np.asarray([np.asarray(img) for img in data["observation"]["rgb"]])
 
             episode = []
-            success_count = 0
+
             for i in range(len(actions)):
                 episode.append({
                     'observation': {
                         'image': images[i],
                     },
                     'action': actions[i],
-                    'language_instruction': ins,
                 })
-
-                if data["info"][i]["success"]:
-                    success_count += 1
-                else:
-                    success_count = 0
-
-                if success_count >= 6:
-                    break
 
             # create output data sample
             sample = {
@@ -126,10 +109,10 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
             }
             del data
 
-            return sample, num_filtered
+            return sample
 
         tasks = [
-            {"name": "../../../ManiSkill/mp_collect/PutOnPlateInScene25Main-v3/16400/data"},
+            {"name": "/home/chenyinuo/data/dataset/bingwen/data_for_success/green_bell_pepper_plate_wooden/success"},
         ]
 
         all_files = []
@@ -169,7 +152,7 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
             )
             for future in done:
                 ep_path = futures.pop(future)
-                sample, num_filtered = future.result()
+                sample = future.result()
                 yield ep_path, sample
 
                 try:
