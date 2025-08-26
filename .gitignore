@@ -19,8 +19,13 @@ __pycache__
 /Maniskill/mp_collect/
 /openvla/checkpoints/
 /openvla/wandb/
-/SimpleEnv/octo_collect/
-/SimpleEnv/wandb/
+/SimplerEnv/octo_collect/
+/SimplerEnv/wandb/
 
 /wandb/
 runs/
+README_7D_Unified_System.md
+README_Absolute_Position_Update.md
+README_Image_Format_Fix.md
+README_PPO_Training.md
+README_Quaternion_To_Euler.md

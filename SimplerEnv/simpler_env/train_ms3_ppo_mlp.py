@@ -48,11 +48,11 @@ class Args:
     is_table_green: bool = False
     robot_uids: Annotated[Optional[str], tyro.conf.arg(aliases=["-r"])] = None
 
-    object_name: Optional[str] = "tomato"
+    object_name: Optional[str] = "green_bell_pepper"
     container_name: Optional[str] = "plate"
 
     steps_max: int = 2000000
-    interval_eval: int = 2
+    interval_eval: int = 10
     interval_save: int = 40
 
 
@@ -81,9 +81,36 @@ class Args:
 
     # mlp
     mlp_embedding_size: int = 512
+    pretrained_mlp_path: Optional[str] = None  # Path to pretrained MLP model from SFT
     
 
 
+
+def process_image_for_model(obs_image):
+    """Convert image from (B, H, W, C) to (B, C, H, W) and normalize"""
+    print(f"Input image shape: {obs_image.shape}")  # 调试信息
+    
+    # 确保输入是tensor
+    if not isinstance(obs_image, torch.Tensor):
+        obs_image = torch.tensor(obs_image)
+    
+    # 检查是否为BHWC格式 (batch, height, width, channels)
+    if len(obs_image.shape) == 4 and obs_image.shape[-1] == 3:
+        print(f"Converting from BHWC {obs_image.shape} to BCHW format")
+        obs_image = obs_image.float() / 255.0  # normalize to [0, 1]
+        obs_image = obs_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
+        print(f"After conversion: {obs_image.shape}")
+    
+    # 检查是否已经是BCHW格式 (batch, channels, height, width)
+    elif len(obs_image.shape) == 4 and obs_image.shape[1] == 3:
+        print(f"Already in BCHW format: {obs_image.shape}")
+        obs_image = obs_image.float() / 255.0 if obs_image.dtype != torch.float32 else obs_image
+    
+    # 处理其他可能的格式
+    else:
+        raise ValueError(f"Unexpected image shape: {obs_image.shape}. Expected (B, H, W, 3) or (B, 3, H, W)")
+    
+    return obs_image
 
 class Runner:
     def __init__(self, all_args: Args):
@@ -119,6 +146,12 @@ class Runner:
             self.device_env = self.device
 
         self.policy = MLPPolicy(all_args, self.device)
+        
+        # Load pretrained model if provided
+        if self.args.pretrained_mlp_path is not None:
+            print(f"Loading pretrained MLP model from: {self.args.pretrained_mlp_path}")
+            self.policy.load(Path(self.args.pretrained_mlp_path))
+            print("Successfully loaded pretrained MLP model!")
 
         self.alg = MLPPPO(all_args, self.policy)
 
@@ -130,7 +163,7 @@ class Runner:
             all_args,
             obs_dim=(480, 640, 3),
             state_dim=0,  # No state input
-            act_dim=8,  # 7 pose + 1 gripper
+            act_dim=7,  # 3 pos + 3 euler + 1 gripper
         )
         minibatch_count = self.buffer.get_minibatch_count()
         print(f"Buffer minibatch count: {minibatch_count}")
@@ -166,6 +199,7 @@ class Runner:
 
         obs_image = self.buffer.obs[self.buffer.step]
         obs_image = torch.tensor(obs_image).to(self.device)
+        obs_image = process_image_for_model(obs_image)
 
         # No state needed
         obs = dict(image=obs_image)
@@ -191,6 +225,8 @@ class Runner:
         self.policy.prep_rollout()
 
         obs_image = torch.tensor(self.buffer.obs[-1]).to(self.device)
+        obs_image = process_image_for_model(obs_image)
+            
         # No state needed
         obs = dict(image=obs_image)
         with torch.no_grad():
@@ -223,12 +259,13 @@ class Runner:
         obs_img = torch.tensor(obs_img).to(self.device)
 
         for _ in range(self.args.episode_len):
-            obs = dict(image=obs_img)  # only image
-            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor
+            obs_img_processed = process_image_for_model(obs_img)
+            obs = dict(image=obs_img_processed)  # only image
             value, action, logprob = self._get_action(obs, deterministic=True) # need tensor
             print(f"!!action: {action[0]}")
 
             obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
+            obs_img = torch.tensor(obs_img).to(self.device)
 
             # info
             print({k: round(v.to(torch.float32).mean().tolist(), 4) for k, v in env_info.items() if k != "episode"})
@@ -259,16 +296,18 @@ class Runner:
         } for idx in range(self.args.num_envs)]
 
         obs_img, _, info = self.env_wrapper.reset(eps_count=0) # obs_img: np.ndarray, ignore state, info: dict
+        obs_img = torch.tensor(obs_img).to(self.device)
 
         # No state data to dump since we don't use state
 
         for _ in range(self.args.episode_len):
-            obs = dict(image=obs_img) # obs: dict, image: np.ndarray
-            obs = {k: torch.tensor(v) for k, v in obs.items()} # obs: dict, image: tensor
+            obs_img_processed = process_image_for_model(obs_img)
+            obs = dict(image=obs_img_processed) # obs: dict, image: tensor
             value, action, logprob = self._get_action(obs, deterministic=True) # action: tensor
 
             #action: tensor, obs_img: np.ndarray, reward: tensor, terminated: tensor, truncated: tensor, env_info: dict
-            obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state 
+            obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
+            obs_img_new = torch.tensor(obs_img_new).to(self.device) 
 
             # info
             print({k: round(v.to(torch.float32).mean().tolist(), 4) for k, v in env_info.items() if k != "episode"})

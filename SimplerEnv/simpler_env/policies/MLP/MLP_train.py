@@ -66,8 +66,8 @@ class MLPPolicy(nn.Module):
         ).to(**self.tpdv)
 
         # 4. Actor and Critic Heads
-        # Use action_dim from args if available, otherwise default to 8
-        self.action_dim = getattr(self.args, 'action_dim', 8)  # 7 (pose) + 1 (gripper)
+        # Use action_dim from args if available, otherwise default to 7
+        self.action_dim = getattr(self.args, 'action_dim', 7)  # 3 (pos) + 3 (euler) + 1 (gripper)
         self.actor = nn.Sequential(
             nn.Linear(final_embedding_dim, 512),
             nn.ReLU(),
@@ -169,7 +169,7 @@ class MLPPolicy(nn.Module):
         log_prob = dist.log_prob(raw_action).sum(axis=-1, keepdim=True)
         value = self.critic(embedding)
         
-        final_action = raw_action #10D
+        final_action = raw_action  # 7D: 3 pos + 3 euler + 1 gripper
         
         return value, final_action, log_prob
 

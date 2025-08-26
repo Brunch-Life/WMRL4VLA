@@ -28,6 +28,7 @@ import wandb
 import numpy as np
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset
+from scipy.spatial.transform import Rotation as R
 from transformers import AutoProcessor
 from PIL import Image
 import draccus
@@ -52,7 +53,7 @@ class MLPFinetuneConfig:
     batch_size: int = 256                                          # Fine-tuning batch size
     max_steps: int = 50_000                                         # Max number of fine-tuning steps
     eval_steps: int = 1000                                           # Interval for evaluation
-    save_steps: str = "5000,10000,20000,50000"                     # Steps to save checkpoints
+    save_steps: str = "1,5000,10000,20000,50000"                     # Steps to save checkpoints
     learning_rate: float = 1e-4                                    # Fine-tuning learning rate
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
@@ -60,7 +61,7 @@ class MLPFinetuneConfig:
     
     # MLP Model Parameters  
     mlp_embedding_size: int = 512                                   # MLP embedding size
-    action_dim: int = 8                                             # Action dimension (8D from dataset)
+    action_dim: int = 7                                             # Action dimension (3 pos + 3 euler + 1 gripper)
     state_dim: int = 0                                              # State dimension (not used)
     
     # Loss Weights
@@ -92,11 +93,20 @@ def _load_single_file(file_path: str, image_size: tuple = (480, 640)):
         data = np.load(file_path, allow_pickle=True)["arr_0"].tolist()
         
         # parse action data
+        position = data["action"]["end"]["position"].squeeze(1)  # (T, 3)
+        orientation_quat = data["action"]["end"]["orientation"].squeeze(1)  # (T, 4) quaternion
+        gripper = data["action"]["effector"]["position_gripper"]  # (T, 1)
+        
+        # Convert quaternion to euler angles
+        # orientation_quat is in (x, y, z, w) format, scipy expects (x, y, z, w)
+        euler_angles = R.from_quat(orientation_quat).as_euler('xyz', degrees=False)  # (T, 3)
+        
+        # Concatenate: position (3) + euler (3) + gripper (1) = 7D action
         actions = np.concatenate([
-            data["action"]["end"]["position"].squeeze(1), 
-            data["action"]["end"]["orientation"].squeeze(1), 
-            data["action"]["effector"]["position_gripper"]
-        ], axis=1).astype(np.float32)
+            position,      # (T, 3)
+            euler_angles,  # (T, 3) 
+            gripper        # (T, 1)
+        ], axis=1).astype(np.float32)  # (T, 7)
         
         # parse image data
         raw_images = data["observation"]["rgb"]
@@ -255,7 +265,7 @@ class NPZDataset(IterableDataset):
             return None
 
 
-def create_args_mock(mlp_embedding_size, alg_lr, action_dim=8):
+def create_args_mock(mlp_embedding_size, alg_lr, action_dim=7):
     """create a mock args object for MLPPolicy"""
     class MockArgs:
         def __init__(self, mlp_embedding_size, alg_lr, action_dim):

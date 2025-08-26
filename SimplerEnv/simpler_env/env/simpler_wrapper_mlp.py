@@ -193,58 +193,22 @@ class MLPMS3Wrapper:
 
     #     return reward
 
-    def get_T_from_mat_and_pos_batch(self, mat: np.ndarray, pos: np.ndarray) -> np.ndarray:
-        T_list = []
-        for i in range(mat.shape[0]):
-            T = self.get_T_from_mat_and_pos(mat[i], pos[i])
-            T_list.append(T)
-        T_batch = np.stack(T_list)
-        return T_batch
-
-    def get_T_from_mat_and_pos(self, mat: np.ndarray, pos: np.ndarray) -> np.ndarray:
-        assert mat.shape == (3, 3)
-        assert pos.shape == (3,)
-        T = np.eye(4)
-        T[:3, :3] = mat
-        T[:3, 3] = pos
-        return T
-
-    def get_mat_from_6d_batch(self, mat_6d: np.ndarray) -> np.ndarray:
-        mat_6d = mat_6d.reshape(-1, 3, 2)
-        mat_6d[:, :, 0] = mat_6d[:, :, 0] / np.linalg.norm(mat_6d[:, :, 0]) # [B, 3,1]
-        mat_6d[:, :, 1] = mat_6d[:, :, 1] / np.linalg.norm(mat_6d[:, :, 1]) # [B, 3,1]
-        z_vec = np.cross(mat_6d[:, :, 0], mat_6d[:, :, 1]) # [B, 3,1]
-        z_vec = z_vec[:, :, np.newaxis]  # (B, 3, 1)
-        mat = np.concatenate([mat_6d, z_vec], axis=2) # [B, 3, 3]
-        return mat
+# Removed 6D rotation and transformation matrix methods - no longer needed for 7D direct actions
 
 
     def _process_action(self, raw_actions: torch.Tensor) -> np.ndarray:
+        # Process 7D absolute action: [pos(3), euler(3), gripper(1)] → return 7D directly
+        abs_action = raw_actions.cpu().numpy()  # [B, 7]
 
-        # transform delta action to absolute action
-        delta_action = raw_actions.cpu().numpy() # [B, 10]
+        abs_pos = abs_action[:, :3]  # [B, 3] - absolute position
+        abs_euler = abs_action[:, 3:6]  # [B, 3] - absolute euler angles
+        scaled_gripper_width = abs_action[:, 6:7]  # [B, 1] - gripper (-1 to 1)
+        
+        # Convert gripper from [-1,1] to actual width
+        abs_gripper_width = scaled_gripper_width * (self.gripper_high - self.gripper_low) + self.gripper_low # [B, 1]
 
-        delta_pos = delta_action[:, :3] # [B, 3]
-        delta_6d = delta_action[:, 3:9] # [B, 6]
-        scaled_gripper_width = delta_action[:, 9:] # [B, 1] -1 ~ 1
-        abs_gripper_width = scaled_gripper_width * (self.gripper_high - self.gripper_low) + self.gripper_low # [B, 1] -0.01 ~ 0.04
-
-        delta_mat = self.get_mat_from_6d_batch(delta_6d) # [B, 3, 3]
-        delta_T = self.get_T_from_mat_and_pos_batch(delta_mat, delta_pos) # [B, 4, 4]
-        state = self.get_state() # [B, 10]
-
-
-        state_pos = state[:, :3] # [B, 3]
-        state_mat_6d = state[:, 3:9] # [B, 6]
-        state_mat = self.get_mat_from_6d_batch(state_mat_6d) # [B, 3, 3]
-
-        state_T = self.get_T_from_mat_and_pos_batch(state_mat, state_pos) # [B, 4, 4]
-        action_T = state_T @ delta_T # [B, 4, 4]
-        action_mat = action_T[:, :3, :3] # [B, 3, 3]
-        action_mat_6d = action_mat[:, :3, :2].reshape(-1, 6) # [B, 6]
-        action_pos = action_T[:, :3, 3] # [B, 3]
-        action_gripper_width_abs = abs_gripper_width # [B, 1]
-        action = np.concatenate([action_pos, action_mat_6d, action_gripper_width_abs], axis=-1) # [B, 10]
+        # Return 7D action directly for environment
+        action = np.concatenate([abs_pos, abs_euler, abs_gripper_width], axis=-1)  # [B, 7]
 
         return action
 
@@ -272,14 +236,7 @@ class MLPMS3Wrapper:
         return obs_image, state, info
 
     def step(self, raw_action) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-        action_abs = self._process_action(raw_action) # [B, 10] np.ndarray
-
-        # transform 6d to euler
-        action_pos, action_mat_6d, action_gripper_width_abs = action_abs[:, :3], action_abs[:, 3:9], action_abs[:, 9:]
-        action_mat = self.get_mat_from_6d_batch(action_mat_6d)
-        action_euler = matrix_to_euler_angles(torch.from_numpy(action_mat).to(self.device), "XYZ").cpu().numpy()
-
-        action_abs = np.concatenate([action_pos, action_euler, action_gripper_width_abs], axis=-1) # [B,7]
+        action_abs = self._process_action(raw_action)  # [B, 7] np.ndarray - already in final format
 
         obs, reward, terminated, truncated, info = self.env.step(action_abs)
         obs_image = obs["sensor_data"]["3rd_view_camera"]["rgb"].to(torch.uint8).cpu().numpy()
