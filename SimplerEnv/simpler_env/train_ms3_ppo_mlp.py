@@ -88,22 +88,17 @@ class Args:
 
 def process_image_for_model(obs_image):
     """Convert image from (B, H, W, C) to (B, C, H, W) and normalize"""
-    print(f"Input image shape: {obs_image.shape}")  # 调试信息
-    
     # 确保输入是tensor
     if not isinstance(obs_image, torch.Tensor):
         obs_image = torch.tensor(obs_image)
     
     # 检查是否为BHWC格式 (batch, height, width, channels)
     if len(obs_image.shape) == 4 and obs_image.shape[-1] == 3:
-        print(f"Converting from BHWC {obs_image.shape} to BCHW format")
         obs_image = obs_image.float() / 255.0  # normalize to [0, 1]
         obs_image = obs_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
-        print(f"After conversion: {obs_image.shape}")
     
     # 检查是否已经是BCHW格式 (batch, channels, height, width)
     elif len(obs_image.shape) == 4 and obs_image.shape[1] == 3:
-        print(f"Already in BCHW format: {obs_image.shape}")
         obs_image = obs_image.float() / 255.0 if obs_image.dtype != torch.float32 else obs_image
     
     # 处理其他可能的格式

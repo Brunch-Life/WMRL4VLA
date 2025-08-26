@@ -34,6 +34,28 @@ from collections import defaultdict
 from tqdm import tqdm
 
 
+def process_image_for_model_training(obs_image):
+    """Convert image from (B, H, W, C) to (B, C, H, W) and normalize for training"""
+    # 确保输入是tensor
+    if not isinstance(obs_image, torch.Tensor):
+        obs_image = torch.tensor(obs_image)
+    
+    # 检查是否为BHWC格式 (batch, height, width, channels)
+    if len(obs_image.shape) == 4 and obs_image.shape[-1] == 3:
+        obs_image = obs_image.float() / 255.0  # normalize to [0, 1]
+        obs_image = obs_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
+    
+    # 检查是否已经是BCHW格式 (batch, channels, height, width)
+    elif len(obs_image.shape) == 4 and obs_image.shape[1] == 3:
+        obs_image = obs_image.float() / 255.0 if obs_image.dtype != torch.float32 else obs_image
+    
+    # 处理其他可能的格式
+    else:
+        raise ValueError(f"Unexpected image shape: {obs_image.shape}. Expected (B, H, W, 3) or (B, 3, H, W)")
+    
+    return obs_image
+
+
 def huber_loss(e, d):
     a = (abs(e) <= d).to(torch.float32)
     b = (abs(e) > d).to(torch.float32)
@@ -247,8 +269,10 @@ class MLPPPO:
         obs_image, obs_state, actions, value_preds, returns, masks, old_logprob, advantages = batch
 
         # Only use image, ignore state
+        # Process image format from BHWC to BCHW before passing to model
+        processed_image = process_image_for_model_training(obs_image)
         obs = dict(
-            image=torch.tensor(obs_image).to(**self.tpdv)
+            image=processed_image.to(**self.tpdv)
         )
         actions = torch.tensor(actions).to(**self.tpdv)
         value_preds = torch.tensor(value_preds).to(**self.tpdv)
