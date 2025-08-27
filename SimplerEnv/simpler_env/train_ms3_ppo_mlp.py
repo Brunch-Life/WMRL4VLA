@@ -20,6 +20,12 @@ from mani_skill.utils.visualization.misc import images_to_video
 from simpler_env.env.simpler_wrapper_mlp import MLPMS3Wrapper
 from simpler_env.utils.replay_buffer_mlp import SeparatedReplayBufferMLP
 
+# import angle processing utilities
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent.parent))  # Add project root to path
+from angle_utils import postprocess_action_for_env
+
 signal.signal(signal.SIGINT, signal.SIG_DFL)  # allow ctrl+c
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -262,7 +268,9 @@ class Runner:
             value, action, logprob = self._get_action(obs, deterministic=True) # need tensor
             print(f"!!action: {action[0]}")
 
-            obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
+            # Apply phase shift restoration before sending to environment
+            env_action = postprocess_action_for_env(action)
+            obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(env_action)  # ignore state
             obs_img = torch.tensor(obs_img).to(self.device)
 
             # info
@@ -303,8 +311,10 @@ class Runner:
             obs = dict(image=obs_img_processed) # obs: dict, image: tensor
             value, action, logprob = self._get_action(obs, deterministic=True, render_mode=True) # action: tensor
 
+            # Apply phase shift restoration before sending to environment
+            env_action = postprocess_action_for_env(action)
             #action: tensor, obs_img: np.ndarray, reward: tensor, terminated: tensor, truncated: tensor, env_info: dict
-            obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
+            obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(env_action)  # ignore state
             obs_img_new = torch.tensor(obs_img_new).to(self.device) 
 
             # info
@@ -314,7 +324,8 @@ class Runner:
                     env_infos[f"{k}"] += v
 
             for i in range(self.args.num_envs):
-                post_action = self.env_wrapper._process_action(action) # need tensor
+                # Use the environment action (after phase shift restoration) for logging
+                post_action = self.env_wrapper._process_action(env_action) # need tensor
                 log_image = obs_img[i].cpu().numpy()  # Convert to numpy for video generation
                 log_action = post_action[i].tolist()
                 log_info = {k: v[i].tolist() for k, v in env_info.items() if k != "episode"}
@@ -397,7 +408,9 @@ class Runner:
                            position=1, 
                            leave=False):
                 value, action, logprob = self.collect()
-                obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
+                # Apply phase shift restoration before sending to environment
+                env_action = postprocess_action_for_env(action)
+                obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(env_action)  # ignore state
 
                 data = (obs_img, action, logprob, value, reward, terminated, truncated)  # removed state
                 self.insert(data)

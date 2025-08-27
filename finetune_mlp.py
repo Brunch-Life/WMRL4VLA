@@ -36,6 +36,9 @@ import draccus
 # import MLP related from SimplerEnv
 from simpler_env.policies.MLP.MLP_train import MLPPolicy
 
+# import angle processing utilities
+from angle_utils import preprocess_action_for_training, robust_unwrap_angles
+
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -107,6 +110,23 @@ def _load_single_file(file_path: str, image_size: tuple = (480, 640)):
             euler_angles,  # (T, 3) 
             gripper        # (T, 1)
         ], axis=1).astype(np.float32)  # (T, 7)
+        
+        # 🔧 Apply phase shift to euler angles to solve -π/π discontinuity problem
+        # This shifts the discontinuity from ±π to 0, making training more stable
+        try:
+            # First try robust unwrapping for time-series continuity
+            euler_part = actions[:, 3:6]
+            euler_x_unwrapped = robust_unwrap_angles(euler_part[:, 0])
+            euler_z_unwrapped = robust_unwrap_angles(euler_part[:, 2])
+            euler_part[:, 0] = euler_x_unwrapped
+            euler_part[:, 2] = euler_z_unwrapped
+            actions[:, 3:6] = euler_part
+        except Exception as e:
+            print(f"Warning: robust unwrapping failed: {e}")
+            pass
+            
+        # Apply phase shift for training (moves discontinuity from ±π to 0)
+        actions = preprocess_action_for_training(actions)
         
         # parse image data
         raw_images = data["observation"]["rgb"]
