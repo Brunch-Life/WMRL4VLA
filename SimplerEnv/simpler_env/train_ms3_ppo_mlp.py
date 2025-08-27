@@ -40,8 +40,8 @@ class Args:
     name: str = "PPO-test"
 
     # env
-    num_envs: int = 128
-    episode_len: int = 500
+    num_envs: int = 64
+    episode_len: int = 200
     shader: str = "default"
     use_same_init: bool = False
     control_mode: str = "pd_ee_pose"
@@ -52,13 +52,13 @@ class Args:
     container_name: Optional[str] = "plate"
 
     steps_max: int = 2000000
-    interval_eval: int = 10
-    interval_save: int = 40
+    interval_eval: int = 2
+    interval_save: int = 1
 
 
     # buffer
     buffer_inferbatch: int = num_envs
-    buffer_minibatch: int = 32
+    buffer_minibatch: int = 128
     buffer_gamma: float = 0.99
     buffer_lambda: float = 0.95
 
@@ -69,7 +69,7 @@ class Args:
     alg_gradient_accum: int = 20
     alg_ppo_epoch: int = 1
     alg_entropy_coef: float = 0.0
-    alg_lr: float = 1e-4
+    alg_lr: float = 3e-5
 
 
     # other
@@ -164,7 +164,7 @@ class Runner:
         print(f"Buffer minibatch count: {minibatch_count}")
 
     @torch.no_grad()
-    def _get_action(self, obs: dict, deterministic=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_action(self, obs: dict, deterministic=False, render_mode=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert isinstance(obs, dict)
         assert isinstance(obs["image"], torch.Tensor)
         # No longer need state assertion
@@ -175,9 +175,12 @@ class Runner:
         actions = []
         logprobs = []
 
-        for i in range(0, total_batch, self.args.buffer_inferbatch):
+        # Use smaller batch size for render to save memory
+        batch_size = 16 if render_mode else self.args.buffer_inferbatch
+        
+        for i in range(0, total_batch, batch_size):
             # Only pass image data
-            obs_batch = {"image": obs["image"][i:i + self.args.buffer_inferbatch]}
+            obs_batch = {"image": obs["image"][i:i + batch_size]}
             value, action, logprob = self.policy.get_action(obs_batch, deterministic)
             values.append(value)
             actions.append(action)
@@ -295,10 +298,10 @@ class Runner:
 
         # No state data to dump since we don't use state
 
-        for _ in range(self.args.episode_len):
+        for step in range(self.args.episode_len):
             obs_img_processed = process_image_for_model(obs_img)
             obs = dict(image=obs_img_processed) # obs: dict, image: tensor
-            value, action, logprob = self._get_action(obs, deterministic=True) # action: tensor
+            value, action, logprob = self._get_action(obs, deterministic=True, render_mode=True) # action: tensor
 
             #action: tensor, obs_img: np.ndarray, reward: tensor, terminated: tensor, truncated: tensor, env_info: dict
             obs_img_new, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
@@ -312,7 +315,7 @@ class Runner:
 
             for i in range(self.args.num_envs):
                 post_action = self.env_wrapper._process_action(action) # need tensor
-                log_image = obs_img[i]
+                log_image = obs_img[i].cpu().numpy()  # Convert to numpy for video generation
                 log_action = post_action[i].tolist()
                 log_info = {k: v[i].tolist() for k, v in env_info.items() if k != "episode"}
                 datas[i]["image"].append(log_image)
@@ -324,7 +327,7 @@ class Runner:
 
         # data dump: last image
         for i in range(self.args.num_envs):
-            log_image = obs_img[i]
+            log_image = obs_img[i].cpu().numpy()  # Convert to numpy for video generation
             datas[i]["image"].append(log_image)
 
         # save video
@@ -364,18 +367,23 @@ class Runner:
         save_stats["env_name"] = self.args.env_id
         save_stats["ep_len"] = self.args.episode_len
         save_stats["epoch"] = epoch
-        save_stats["stats"] = {k: v.item() for k, v in env_stats.items()}
+        save_stats["stats"] = {k: v.item() if hasattr(v, 'item') else v for k, v in env_stats.items()}
         # No state to save since we don't use state
         save_stats["last_info"] = last_info
 
         yaml.dump(save_stats, open(exp_dir / "stats.yaml", "w"))
 
+        # Clear render data from memory
+        del datas, env_infos, last_info, save_stats
+        torch.cuda.empty_cache()
+
         return env_stats_ret
 
     def run(self):
         max_episodes = self.args.steps_max // self.args.episode_len // self.args.num_envs
+        print(f"Starting training with {max_episodes} total episodes")
 
-        for episode in range(max_episodes):
+        for episode in tqdm(range(max_episodes), desc="Training Episodes", position=0):
             env_infos = defaultdict(lambda: [])
             ep_time = time.time() 
 
@@ -384,7 +392,10 @@ class Runner:
             # TODO: check buffer warmup
             self.buffer.warmup(obs_img, None)  # no state
 
-            for _ in tqdm(range(self.args.episode_len), desc="rollout"):
+            for step in tqdm(range(self.args.episode_len), 
+                           desc=f"Episode {episode+1}/{max_episodes} - Rollout", 
+                           position=1, 
+                           leave=False):
                 value, action, logprob = self.collect()
                 obs_img, _, reward, terminated, truncated, env_info = self.env_wrapper.step(action)  # ignore state
 
@@ -398,8 +409,7 @@ class Runner:
 
             # steps
             steps = (episode + 1) * self.args.episode_len * self.args.num_envs
-            print(pprint.pformat({k: round(np.mean(v), 4) for k, v in env_infos.items()}))
-
+            
             # train and process infos
             self.compute_endup()
             del value, action, logprob, obs_img, reward, terminated, truncated
@@ -415,28 +425,50 @@ class Runner:
             wandb.log(infos, step=steps)
 
             elapsed_time = time.time() - ep_time
-            print(f"{self.args.name}: ep {episode:0>4d} | steps {steps} | e {elapsed_time:.2f}s")
-            print(pprint.pformat({k: round(v, 4) for k, v in infos.items()}))
+            
+            # Format training information output
+            env_metrics = {k: round(np.mean(v), 4) for k, v in env_infos.items()}
+            success_rate = env_metrics.get('success', 0.0)
+            
+            print(f"\nEpisode {episode+1:04d}/{max_episodes} completed!")
+            print(f"   Success rate: {success_rate:.1%}")
+            print(f"   Total steps: {steps:,}")
+            print(f"   Duration: {elapsed_time:.2f}s")
+            if env_metrics:
+                print(f"   Env metrics: {env_metrics}")
+            
+            # Show key training metrics
+            key_train_metrics = {k: round(v, 4) for k, v in infos.items() 
+                               if any(x in k.lower() for x in ['loss', 'lr', 'reward', 'success'])}
+            if key_train_metrics:
+                print(f"   Train metrics: {key_train_metrics}")
 
             # eval
             if episode % self.args.interval_eval == self.args.interval_eval - 1 or episode == max_episodes - 1:
-                print(f"Evaluating at {steps}")
+                print(f"\nStarting evaluation (Episode {episode+1}, Steps {steps:,})")
                 sval_stats = self.eval()
+                eval_success_rate = sval_stats.get('success', 0.0)
+                print(f"   Eval success rate: {eval_success_rate:.1%}")
+                
                 sval_stats = {f"eval/{k}": v for k, v in sval_stats.items()}
-                wandb.log(sval_stats, step=steps)
-
-                sval_stats = self.eval()
-                sval_stats = {f"eval/{k}_ood": v for k, v in sval_stats.items()}
                 wandb.log(sval_stats, step=steps)
 
             # save
             if episode % self.args.interval_save == self.args.interval_save - 1 or episode == max_episodes - 1:
-                print(f"Saving model at {steps}")
+                print(f"\nSaving model and videos (Episode {episode+1}, Steps {steps:,})")
                 save_path = self.glob_dir / f"steps_{episode:0>4d}"
                 self.policy.save(save_path)
+                print(f"   Model saved to: {save_path}")
 
+                print("   Generating training video...")
                 self.render(epoch=episode)
-                self.render(epoch=episode)
+                print(f"   Videos saved to: {self.glob_dir}/vis_{episode}/")
+                
+                # Clear GPU memory after rendering
+                print("   Clearing GPU memory...")
+                torch.cuda.empty_cache()
+                gc.collect()
+                print("   GPU memory cleared")
 
 
 def main():

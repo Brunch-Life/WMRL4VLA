@@ -1,4 +1,4 @@
-cuda=5
+cuda=4
 
 echo "CUDA_VISIBLE_DEVICES: $cuda"
 

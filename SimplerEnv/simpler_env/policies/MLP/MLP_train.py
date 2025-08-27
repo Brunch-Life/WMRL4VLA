@@ -79,27 +79,37 @@ class MLPPolicy(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         resnet_feature_dim = 512  # ResNet18 final feature dimension
 
-        # 2. Image processing MLP (replacing fusion MLP)
+        # 2. Image processing MLP - 5 layers with 1024 hidden units each
         final_embedding_dim = self.args.mlp_embedding_size
         self.image_mlp = nn.Sequential(
-            nn.Linear(resnet_feature_dim, 512),
+            nn.Linear(resnet_feature_dim, 1024),  # 512 -> 1024
             nn.ReLU(),
-            nn.Linear(512, final_embedding_dim)
+            nn.Linear(1024, 1024),  # 1024 -> 1024
+            nn.ReLU(),
+            nn.Linear(1024, 1024),  # 1024 -> 1024
+            nn.ReLU(),
+            nn.Linear(1024, 1024),  # 1024 -> 1024
+            nn.ReLU(),
+            nn.Linear(1024, final_embedding_dim)  # 1024 -> final_embedding_dim
         ).to(**self.tpdv)
 
-        # 4. Actor and Critic Heads
+        # 4. Actor and Critic Heads - enlarged to match the increased network capacity
         # Use action_dim from args if available, otherwise default to 7
         self.action_dim = getattr(self.args, 'action_dim', 7)  # 3 (pos) + 3 (euler) + 1 (gripper)
         self.actor = nn.Sequential(
-            nn.Linear(final_embedding_dim, 512),
+            nn.Linear(final_embedding_dim, 1024),
             nn.ReLU(),
-            nn.Linear(512, self.action_dim)
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, self.action_dim)
         ).to(**self.tpdv)
         
         self.critic = nn.Sequential(
-            nn.Linear(final_embedding_dim, 512),
+            nn.Linear(final_embedding_dim, 1024),
             nn.ReLU(),
-            nn.Linear(512, 1)
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1)
         ).to(**self.tpdv)
 
         # Learnable parameter for the standard deviation of the action distribution

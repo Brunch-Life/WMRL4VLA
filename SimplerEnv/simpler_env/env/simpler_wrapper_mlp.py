@@ -80,67 +80,111 @@ class MLPMS3Wrapper:
         return state
 
     def get_reward(self, info) -> torch.Tensor:
-        pos_src = info['pos_src']
-        pos_tgt = info['pos_tgt']
-        tcp_pose = info['tcp_pose']
-        gripper_width = torch.from_numpy(self.state_gripper_width).to(self.device)
+        """
+        Sparse reward implementation:
+        - Grasp success: +10 reward
+        - Task completion: +100 reward 
+        - Small time penalty: -0.01 per step
+        """
         success = info['success']
         is_src_obj_grasped = info['is_src_obj_grasped']
 
         rewards = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
         
-        #for first step
+        #for first step - initialize old states for tracking state changes
         for env_idx in range(self.num_envs):
             if info['elapsed_steps'][env_idx] == 1:
-                self.tcp_pose_old[env_idx] = tcp_pose[env_idx]
-                self.pos_src_old[env_idx] = pos_src[env_idx]
-                self.pos_tgt_old[env_idx] = pos_tgt[env_idx]
-                self.gripper_width_old[env_idx] = gripper_width[env_idx]
                 self.is_src_obj_grasped_old[env_idx] = is_src_obj_grasped[env_idx]
 
             reward = torch.zeros(1, dtype=torch.float32, device=self.device)
 
-            # time penalty
+            # Small time penalty to encourage efficiency
             time_penalty = -0.01
             reward += time_penalty
 
-
-            # stage reward
-            if not is_src_obj_grasped[env_idx]:
-                # stage 1: move to src
-                dist_to_object = torch.norm(tcp_pose[env_idx] - pos_src[env_idx])
-                dist_to_object_old = torch.norm(self.tcp_pose_old[env_idx] - self.pos_src_old[env_idx])
-                reward += 10 *(dist_to_object_old - dist_to_object)
-
-                # stage 2: ready to grasp
-                dist_xy_to_object = torch.norm(tcp_pose[env_idx, :2] - pos_src[env_idx, :2])
-                dist_xy_to_object_old = torch.norm(self.tcp_pose_old[env_idx, :2] - self.pos_src_old[env_idx, :2])
-                reward += 5 *(dist_xy_to_object_old - dist_xy_to_object)
-
-            #stage 2.5: reward for success grasp time
+            # Sparse reward for successful grasp (when object is first grasped)
             if is_src_obj_grasped[env_idx] and not self.is_src_obj_grasped_old[env_idx]:
                 grasp_bonus = 10
                 reward += grasp_bonus
 
-            if is_src_obj_grasped[env_idx]:
-                #stage 3: move to tgt
-                dist_to_object = torch.norm(pos_src[env_idx] - pos_tgt[env_idx])
-                dist_to_object_old = torch.norm(self.pos_src_old[env_idx] - self.pos_tgt_old[env_idx])
-                reward += 20 * (dist_to_object_old - dist_to_object)
-
-
-            # final target reward and fail penalty
+            # Sparse reward for task completion
             if success[env_idx]:
                 success_bonus = 100
                 reward += success_bonus
 
+            # Penalty for dropping the object after grasping
             if self.is_src_obj_grasped_old[env_idx] and not is_src_obj_grasped[env_idx] and not success[env_idx]:
                 drop_penalty = -10
                 reward += drop_penalty
 
             rewards[env_idx] = reward
+            
+            # Update old state for next step
+            self.is_src_obj_grasped_old[env_idx] = is_src_obj_grasped[env_idx]
 
         return rewards
+
+    # ORIGINAL DENSE REWARD CODE (COMMENTED OUT FOR REFERENCE):
+    # def get_reward(self, info) -> torch.Tensor:
+    #     pos_src = info['pos_src']
+    #     pos_tgt = info['pos_tgt']
+    #     tcp_pose = info['tcp_pose']
+    #     gripper_width = torch.from_numpy(self.state_gripper_width).to(self.device)
+    #     success = info['success']
+    #     is_src_obj_grasped = info['is_src_obj_grasped']
+
+    #     rewards = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
+        
+    #     #for first step
+    #     for env_idx in range(self.num_envs):
+    #         if info['elapsed_steps'][env_idx] == 1:
+    #             self.tcp_pose_old[env_idx] = tcp_pose[env_idx]
+    #             self.pos_src_old[env_idx] = pos_src[env_idx]
+    #             self.pos_tgt_old[env_idx] = pos_tgt[env_idx]
+    #             self.gripper_width_old[env_idx] = gripper_width[env_idx]
+    #             self.is_src_obj_grasped_old[env_idx] = is_src_obj_grasped[env_idx]
+
+    #         reward = torch.zeros(1, dtype=torch.float32, device=self.device)
+
+    #         # time penalty
+    #         time_penalty = -0.01
+    #         reward += time_penalty
+
+    #         # stage reward
+    #         if not is_src_obj_grasped[env_idx]:
+    #             # stage 1: move to src
+    #             dist_to_object = torch.norm(tcp_pose[env_idx] - pos_src[env_idx])
+    #             dist_to_object_old = torch.norm(self.tcp_pose_old[env_idx] - self.pos_src_old[env_idx])
+    #             reward += 10 *(dist_to_object_old - dist_to_object)
+
+    #             # stage 2: ready to grasp
+    #             dist_xy_to_object = torch.norm(tcp_pose[env_idx, :2] - pos_src[env_idx, :2])
+    #             dist_xy_to_object_old = torch.norm(self.tcp_pose_old[env_idx, :2] - self.pos_src_old[env_idx, :2])
+    #             reward += 5 *(dist_xy_to_object_old - dist_xy_to_object)
+
+    #         #stage 2.5: reward for success grasp time
+    #         if is_src_obj_grasped[env_idx] and not self.is_src_obj_grasped_old[env_idx]:
+    #             grasp_bonus = 10
+    #             reward += grasp_bonus
+
+    #         if is_src_obj_grasped[env_idx]:
+    #             #stage 3: move to tgt
+    #             dist_to_object = torch.norm(pos_src[env_idx] - pos_tgt[env_idx])
+    #             dist_to_object_old = torch.norm(self.pos_src_old[env_idx] - self.pos_tgt_old[env_idx])
+    #             reward += 20 * (dist_to_object_old - dist_to_object)
+
+    #         # final target reward and fail penalty
+    #         if success[env_idx]:
+    #             success_bonus = 100
+    #             reward += success_bonus
+
+    #         if self.is_src_obj_grasped_old[env_idx] and not is_src_obj_grasped[env_idx] and not success[env_idx]:
+    #             drop_penalty = -10
+    #             reward += drop_penalty
+
+    #         rewards[env_idx] = reward
+
+    #     return rewards
             
 
 
